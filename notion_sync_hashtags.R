@@ -150,10 +150,6 @@ set_prop <- function(name, value) {
   } else if (tp == "select") {
     v <- as.character(value %||% ""); if (!nzchar(v)) return(NULL)
     list(select = list(name = v))
-    # If your Notion property "tag" is MULTI-SELECT instead, replace the case above with:
-    # } else if (tp == "multi_select") {
-    #   v <- as.character(value %||% ""); if (!nzchar(v)) return(NULL)
-    #   list(multi_select = list(list(name = v)))
   } else NULL
 }
 
@@ -166,8 +162,9 @@ props_from_row <- function(r) {
   pr <- list()
   ttl <- compose_title(r)
   pr[[TITLE_PROP]] <- set_prop(TITLE_PROP, ttl)
-  
-  wanted <- c("tweet_id","tag","tweet_url","publish_dt","username","main_id","text")
+
+  # Include tweet_type; silently ignored if Notion DB has no such property
+  wanted <- c("tweet_id","tag","tweet_url","publish_dt","username","main_id","text","tweet_type")
   for (nm in wanted) {
     if (!is.null(PROPS[[nm]]) && !is.null(r[[nm]])) pr[[nm]] <- set_prop(nm, r[[nm]])
   }
@@ -178,7 +175,7 @@ props_from_row <- function(r) {
 build_index_by_title <- function(titles) {
   by_title <- new.env(parent=emptyenv())
   if (!length(titles)) return(list(by_title = by_title))
-  
+
   i <- 1L
   while (i <= length(titles)) {
     slice <- titles[i:min(i+30L, length(titles))]  # keep filter size modest
@@ -198,7 +195,7 @@ build_index_by_title <- function(titles) {
     i <- i + 31L
     Sys.sleep(RATE_DELAY_SEC/2)
   }
-  
+
   list(by_title = by_title)
 }
 
@@ -224,7 +221,7 @@ update_page <- function(page_id, pr) {
 upsert_row <- function(r, idx = NULL) {
   title_val <- compose_title(r)
   pr_full   <- props_from_row(r)
-  
+
   pid <- NA_character_
   if (!is.null(idx)) {
     pid <- idx$by_title[[title_val]]; if (is.null(pid)) pid <- NA_character_
@@ -239,15 +236,15 @@ upsert_row <- function(r, idx = NULL) {
       if (length(out$results)) pid <- out$results$id[1] else pid <- NA_character_
     }
   }
-  
+
   if (!is.na(pid[1])) {
     ok <- update_page(pid, pr_full)
     return(is.logical(ok) && ok)
   }
-  
+
   pid2 <- create_page(pr_full)
   if (!is.na(pid2[1])) return(TRUE)
-  
+
   # Minimal create with just Title, then patch
   pr_min <- list(); pr_min[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
   pid3 <- create_page(pr_min)
@@ -271,6 +268,26 @@ con <- DBI::dbConnect(
   password = supa_pwd,
   sslmode = "require"
 )
+
+# Detect presence of tweet_type in twitter_hashtags
+HAS_TWEET_TYPE <- tryCatch({
+  q <- "
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = 'twitter_hashtags'
+      AND column_name = 'tweet_type'
+    LIMIT 1"
+  nrow(DBI::dbGetQuery(con, q)) > 0
+}, error = function(...) FALSE)
+
+# Build reusable SELECT column list
+SQL_COLS <- paste(
+  c("tweet_id","tag","tweet_url","publish_dt","username","main_id","text",
+    if (HAS_TWEET_TYPE) "tweet_type" else NULL),
+  collapse = ", "
+)
+
+message(sprintf("tweet_type column detected: %s", if (HAS_TWEET_TYPE) "YES" else "NO"))
 
 since <- as.POSIXct(Sys.time(), tz="UTC") - LOOKBACK_HOURS * 3600
 since_str <- format(since, "%Y-%m-%d %H:%M:%S%z")
@@ -320,12 +337,12 @@ if (INSPECT_FIRST_ROW) {
       FROM twitter_hashtags h
       WHERE %s
     )
-    SELECT tweet_id, tag, tweet_url, publish_dt, username, main_id, text
+    SELECT %s
     FROM ranked
     WHERE rn = 1
     ORDER BY publish_dt %s NULLS LAST, CAST(tweet_id AS TEXT) %s
     LIMIT 1 OFFSET %d
-  ", ORDER_DIR, base_where, ORDER_DIR, ORDER_DIR, CHUNK_OFFSET)
+  ", ORDER_DIR, base_where, SQL_COLS, ORDER_DIR, ORDER_DIR, CHUNK_OFFSET)
   one <- DBI::dbGetQuery(con, test_q)
   if (nrow(one)) {
     if (!is.null(one$publish_dt)) one$publish_dt <- parse_dt(one$publish_dt)
@@ -349,23 +366,23 @@ repeat {
       FROM twitter_hashtags h
       WHERE %s
     )
-    SELECT tweet_id, tag, tweet_url, publish_dt, username, main_id, text
+    SELECT %s
     FROM ranked
     WHERE rn = 1
     ORDER BY publish_dt %s NULLS LAST, CAST(tweet_id AS TEXT) %s
     LIMIT %d OFFSET %d
-  ", ORDER_DIR, base_where, ORDER_DIR, ORDER_DIR, CHUNK_SIZE, offset)
-  
+  ", ORDER_DIR, base_where, SQL_COLS, ORDER_DIR, ORDER_DIR, CHUNK_SIZE, offset)
+
   rows <- DBI::dbGetQuery(con, qry)
   n <- nrow(rows)
   if (!n) break
-  
+
   message(sprintf("Fetched %d rows (offset=%d).", n, offset))
-  
+
   # Build a tiny Notion index for this page (by Title)
   titles <- vapply(seq_len(n), function(i) compose_title(rows[i, , drop=FALSE]), character(1))
   idx <- build_index_by_title(titles)
-  
+
   success <- 0L
   for (i in seq_len(n)) {
     r <- rows[i, , drop = FALSE]
@@ -379,14 +396,14 @@ repeat {
     if (i %% 50 == 0) message(sprintf("Processed %d/%d in this page (ok %d)", i, n, success))
     Sys.sleep(RATE_DELAY_SEC)
   }
-  
+
   total_success <- total_success + success
   total_seen    <- total_seen + n
   offset        <- offset + n
-  
+
   message(sprintf("Page done. %d/%d upserts ok (cumulative ok %d, seen %d of ~%d).",
                   success, n, total_success, total_seen, expected_i))
-  
+
   # Stop early to avoid hard timeout & chain next run
   elapsed_min <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
   if (total_seen >= MAX_ROWS_PER_RUN || elapsed_min >= MAX_MINUTES) {
@@ -405,6 +422,3 @@ message(sprintf("All pages done. Upserts ok: %d. Expected distinct: %d", total_s
 # Tell the workflow we’re finished
 go <- Sys.getenv("GITHUB_OUTPUT")
 if (nzchar(go)) write("next_offset=done", file = go, append = TRUE)
-
-
-
